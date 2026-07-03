@@ -760,6 +760,9 @@ elif page == "💰 Financieel":
                     if bc2.button("🗑️ Verwijderen", key=f"del_bc_{item['id']}"):
                         db.delete_pipeline(item["id"])
                         st.rerun()
+
+    # --- Onderdeel: Lopende kosten -------------------------------------------
+    elif sub_page == "🧾 Lopende kosten":
         top1, top2 = st.columns([4, 1])
         with top1:
             st.caption("Bedrijfskosten en vergoedingen die (nog) betaald moeten worden — inclusief je eigen fee.")
@@ -899,7 +902,7 @@ elif page == "💰 Financieel":
 
         rows = []
         for p in periods:
-            omzet = sum(r["amount"] for r in income_rows if p["start"] <= r["date"] <= p["end"])
+            omzet = float(sum(r["amount"] for r in income_rows if p["start"] <= r["date"] <= p["end"]))
 
             kosten = 0.0
             for c in cost_rows:
