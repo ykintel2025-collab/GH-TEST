@@ -98,6 +98,17 @@ def fill_template(text, debt):
     return text.replace("{naam}", debt.get("creditor_name", ""))
 
 
+def contact_type_picker(key_prefix, current_value=None):
+    """Toont bestaande contacttypes als keuze + optie om een nieuw type te typen."""
+    existing = db.get_contact_types()
+    options = existing + ["➕ Nieuw type..."]
+    default_index = existing.index(current_value) if current_value in existing else len(options) - 1
+    choice = st.selectbox("Type contact", options, index=default_index, key=f"{key_prefix}_typechoice")
+    if choice == "➕ Nieuw type...":
+        return st.text_input("Nieuw type (bijv. 'Hulpverlening', 'Accountant')", value=current_value or "", key=f"{key_prefix}_newtype")
+    return choice
+
+
 # --- Sidebar navigatie -----------------------------------------------------
 with st.sidebar:
     if IS_TEST:
@@ -110,7 +121,10 @@ with st.sidebar:
     st.divider()
     page = st.radio(
         "Navigatie",
-        ["🏠 Dashboard", "📋 Schulden", "✅ Taken", "✉️ Berichten", "📈 Pipeline & Inkomsten", "💧 Liquiditeit"],
+        [
+            "🏠 Dashboard", "📋 Schulden", "👥 Contacten", "✅ Taken", "✉️ Berichten",
+            "📈 Pipeline & Inkomsten", "🧾 Lopende kosten", "🏠 Privé-uitgaven", "💧 Liquiditeit",
+        ],
         label_visibility="collapsed",
     )
 
@@ -200,26 +214,44 @@ elif page == "📋 Schulden":
         st.title("Schulden Overzicht")
     with top2:
         with st.popover("➕ Nieuwe schuld"):
+            existing_contacts = db.get_contacts()
+            contact_choice_options = ["➕ Nieuw contact aanmaken"] + [c["name"] for c in existing_contacts]
+            chosen = st.selectbox("Schuldeiser", contact_choice_options, key="new_debt_contact_choice")
+
             with st.form("add_debt_form", clear_on_submit=True):
-                creditor_name = st.text_input("Schuldeiser")
+                if chosen == "➕ Nieuw contact aanmaken":
+                    new_name = st.text_input("Naam")
+                    new_type = st.text_input("Type contact", value="Schuldeiser")
+                    address = st.text_input("Adres")
+                    acol1, acol2 = st.columns(2)
+                    postal_code = acol1.text_input("Postcode")
+                    city = acol2.text_input("Plaats")
+                    phone = st.text_input("Telefoonnummer", placeholder="06 12345678")
+                    email = st.text_input("E-mailadres")
+                else:
+                    new_name = None
+
                 total_amount = st.number_input("Hoofdsom oorspronkelijk", min_value=0.0, step=100.0)
                 current_amount = st.number_input("Actueel bedrag", min_value=0.0, step=100.0)
                 priority = st.selectbox("Prioriteit", PRIORITIES)
-                st.markdown("**Contactgegevens (optioneel)**")
-                address = st.text_input("Adres")
-                acol1, acol2 = st.columns(2)
-                postal_code = acol1.text_input("Postcode")
-                city = acol2.text_input("Plaats")
-                phone = st.text_input("Telefoonnummer", placeholder="06 12345678")
-                email = st.text_input("E-mailadres")
-                if st.form_submit_button("Toevoegen") and creditor_name:
-                    db.add_debt(
-                        creditor_name, total_amount, current_amount, priority,
-                        address=address or None, postal_code=postal_code or None,
-                        city=city or None, phone=phone or None, email=email or None,
-                    )
-                    st.success(f"Schuld bij {creditor_name} toegevoegd.")
-                    st.rerun()
+
+                if st.form_submit_button("Toevoegen"):
+                    if chosen == "➕ Nieuw contact aanmaken" and new_name:
+                        contact_id = db.add_contact(
+                            new_name, contact_type=new_type or "Schuldeiser",
+                            address=address or None, postal_code=postal_code or None,
+                            city=city or None, phone=phone or None, email=email or None,
+                            created_by=current_user,
+                        )
+                    elif chosen != "➕ Nieuw contact aanmaken":
+                        contact_id = next(c["id"] for c in existing_contacts if c["name"] == chosen)
+                    else:
+                        contact_id = None
+
+                    if contact_id:
+                        db.add_debt(contact_id, total_amount, current_amount, priority)
+                        st.success("Schuld toegevoegd.")
+                        st.rerun()
 
     totals = db.get_totals()
     tc1, tc2, tc3, tc4 = st.columns(4)
@@ -353,6 +385,7 @@ elif page == "📋 Schulden":
                     ccol1, ccol2 = st.columns(2)
                     with ccol1:
                         with st.form(f"contact_form_{debt['id']}"):
+                            c_type = st.text_input("Type contact", value=debt.get("contact_type") or "")
                             c_address = st.text_input("Adres", value=debt.get("address") or "")
                             ac1, ac2 = st.columns(2)
                             c_postal = ac1.text_input("Postcode", value=debt.get("postal_code") or "")
@@ -360,8 +393,9 @@ elif page == "📋 Schulden":
                             c_phone = st.text_input("Telefoonnummer", value=debt.get("phone") or "")
                             c_email = st.text_input("E-mailadres", value=debt.get("email") or "")
                             if st.form_submit_button("💾 Contactgegevens opslaan"):
-                                db.update_debt(
-                                    debt["id"], address=c_address or None, postal_code=c_postal or None,
+                                db.update_contact(
+                                    debt["contact_id"], contact_type=c_type or None,
+                                    address=c_address or None, postal_code=c_postal or None,
                                     city=c_city or None, phone=c_phone or None, email=c_email or None,
                                 )
                                 st.rerun()
@@ -403,6 +437,77 @@ elif page == "📋 Schulden":
                                     st.rerun()
                                 else:
                                     st.error(f"Versturen mislukt: {error}")
+
+# ===========================================================================
+# PAGINA: CONTACTEN (schuldeisers, hulpverlening, accountants, overig)
+# ===========================================================================
+elif page == "👥 Contacten":
+    top1, top2 = st.columns([4, 1])
+    with top1:
+        st.title("Contacten")
+    with top2:
+        with st.popover("➕ Nieuw contact"):
+            with st.form("add_contact_form", clear_on_submit=True):
+                name = st.text_input("Naam")
+                contact_type = contact_type_picker("addcontact")
+                organization = st.text_input("Organisatie (optioneel)")
+                address = st.text_input("Adres")
+                acol1, acol2 = st.columns(2)
+                postal_code = acol1.text_input("Postcode")
+                city = acol2.text_input("Plaats")
+                phone = st.text_input("Telefoonnummer")
+                email = st.text_input("E-mailadres")
+                notes = st.text_area("Notities")
+                if st.form_submit_button("Toevoegen") and name:
+                    db.add_contact(
+                        name, contact_type=contact_type or None, organization=organization or None,
+                        address=address or None, postal_code=postal_code or None, city=city or None,
+                        phone=phone or None, email=email or None, notes=notes or None, created_by=current_user,
+                    )
+                    st.rerun()
+
+    all_types = ["Alle"] + db.get_contact_types()
+    type_filter = st.selectbox("Filter op type", all_types)
+    contacts = db.get_contacts(contact_type=None if type_filter == "Alle" else type_filter)
+
+    search_c = st.text_input("Zoek op naam", placeholder="Zoek contact...")
+    if search_c:
+        contacts = [c for c in contacts if search_c.lower() in c["name"].lower()]
+
+    if not contacts:
+        st.info("Geen contacten gevonden.")
+    else:
+        st.caption(f"{len(contacts)} contacten")
+        for c in contacts:
+            label = f"**{c['name']}**"
+            if c.get("contact_type"):
+                label += f"  ·  _{c['contact_type']}_"
+            with st.expander(label):
+                with st.form(f"edit_contact_{c['id']}"):
+                    e_name = st.text_input("Naam", value=c["name"], key=f"cname_{c['id']}")
+                    e_type = contact_type_picker(f"edit_{c['id']}", current_value=c.get("contact_type"))
+                    e_org = st.text_input("Organisatie", value=c.get("organization") or "", key=f"corg_{c['id']}")
+                    e_address = st.text_input("Adres", value=c.get("address") or "", key=f"cadr_{c['id']}")
+                    ec1, ec2 = st.columns(2)
+                    e_postal = ec1.text_input("Postcode", value=c.get("postal_code") or "", key=f"cpc_{c['id']}")
+                    e_city = ec2.text_input("Plaats", value=c.get("city") or "", key=f"ccity_{c['id']}")
+                    e_phone = st.text_input("Telefoonnummer", value=c.get("phone") or "", key=f"cphone_{c['id']}")
+                    e_email = st.text_input("E-mailadres", value=c.get("email") or "", key=f"cemail_{c['id']}")
+                    e_notes = st.text_area("Notities", value=c.get("notes") or "", key=f"cnotes_{c['id']}")
+                    save_col, del_col = st.columns(2)
+                    if save_col.form_submit_button("💾 Opslaan"):
+                        db.update_contact(
+                            c["id"], name=e_name, contact_type=e_type or None, organization=e_org or None,
+                            address=e_address or None, postal_code=e_postal or None, city=e_city or None,
+                            phone=e_phone or None, email=e_email or None, notes=e_notes or None,
+                        )
+                        st.rerun()
+                    if del_col.form_submit_button("🗑️ Verwijderen"):
+                        success, error = db.delete_contact(c["id"])
+                        if success:
+                            st.rerun()
+                        else:
+                            st.error(error)
 
 # ===========================================================================
 # PAGINA: TAKEN (volledig beheer)
@@ -506,6 +611,27 @@ elif page == "✉️ Berichten":
 # ===========================================================================
 elif page == "📈 Pipeline & Inkomsten":
     st.title("Pipeline & Inkomsten")
+
+    st.subheader("📊 Opbrengsten: begroot vs. werkelijk")
+    with st.popover("➕ Opbrengstenbron toevoegen"):
+        with st.form("add_stream_form", clear_on_submit=True):
+            s_name = st.text_input("Naam (bijv. 'ESPN', 'Lezingen bedrijven')")
+            s_budget = st.number_input("Begroot bedrag per jaar", min_value=0.0, step=500.0)
+            s_year = st.number_input("Jaar", min_value=2020, max_value=2100, value=date.today().year, step=1)
+            if st.form_submit_button("Toevoegen") and s_name:
+                db.add_revenue_stream(s_name, s_budget, year=int(s_year))
+                st.rerun()
+
+    overview = db.get_revenue_overview()
+    if not overview:
+        st.info("Nog geen opbrengstenbronnen toegevoegd.")
+    else:
+        for r in overview:
+            pct = (r["realized_amount"] / r["budgeted_amount"] * 100) if r["budgeted_amount"] else 0
+            st.write(f"**{r['name']}** — {eur(r['realized_amount'])} van {eur(r['budgeted_amount'])} begroot")
+            st.progress(min(pct / 100, 1.0), text=f"{pct:.0f}%")
+
+    st.divider()
     col_income, col_pipeline = st.columns(2)
 
     with col_income:
@@ -514,8 +640,12 @@ elif page == "📈 Pipeline & Inkomsten":
             source = st.text_input("Bron")
             amount = st.number_input("Bedrag", min_value=0.0, step=100.0)
             income_type = st.selectbox("Type", INCOME_TYPES)
+            streams = db.get_revenue_streams()
+            stream_options = {"— geen koppeling —": None}
+            stream_options.update({s["name"]: s["id"] for s in streams})
+            stream_choice = st.selectbox("Koppelen aan opbrengstenbron (optioneel)", list(stream_options.keys()))
             if st.form_submit_button("Inkomsten toevoegen") and source:
-                db.add_income(source, amount, income_type, entered_by=current_user)
+                db.add_income(source, amount, income_type, entered_by=current_user, stream_id=stream_options[stream_choice])
                 st.success("Inkomsten geregistreerd.")
                 st.rerun()
 
@@ -561,6 +691,105 @@ elif page == "📈 Pipeline & Inkomsten":
                         st.rerun()
         else:
             st.info("Nog geen pipeline-items.")
+
+# ===========================================================================
+# PAGINA: LOPENDE KOSTEN (incl. eigen vergoeding)
+# ===========================================================================
+elif page == "🧾 Lopende kosten":
+    top1, top2 = st.columns([4, 1])
+    with top1:
+        st.title("Lopende kosten")
+        st.caption("Bedrijfskosten en vergoedingen die (nog) betaald moeten worden — inclusief je eigen fee.")
+    with top2:
+        with st.popover("➕ Nieuwe kostenpost"):
+            with st.form("add_cost_form", clear_on_submit=True):
+                rc_name = st.text_input("Omschrijving", placeholder="Bijv. 'Beheervergoeding Ibrahim'")
+                rc_category = st.text_input("Categorie", placeholder="Bijv. Personeel, Advies, Hosting")
+                rc_amount = st.number_input("Bedrag", min_value=0.0, step=50.0)
+                rc_frequency = st.selectbox("Frequentie", ["Eenmalig", "Maandelijks", "Jaarlijks"])
+                rc_payable_to = st.selectbox("Te betalen aan", ASSIGNEES + ["Extern"])
+                rc_due = st.date_input("Vervaldatum", value=date.today())
+                rc_notes = st.text_area("Toelichting (optioneel)")
+                if st.form_submit_button("Toevoegen") and rc_name:
+                    db.add_running_cost(
+                        rc_name, rc_amount, current_user, category=rc_category or None,
+                        frequency=rc_frequency, payable_to=rc_payable_to, due_date=rc_due, notes=rc_notes or None,
+                    )
+                    st.rerun()
+
+    filter_status_rc = st.radio("Filter", ["Alle", "Open", "Betaald"], horizontal=True)
+    status_map = {"Open": "Open", "Betaald": "Betaald", "Alle": None}
+    costs = db.get_running_costs(status=status_map[filter_status_rc])
+
+    if not costs:
+        st.info("Nog geen lopende kosten geregistreerd.")
+    else:
+        total_open = sum(c["amount"] for c in costs if c["status"] == "Open")
+        st.metric("Totaal openstaand", eur(total_open))
+        st.divider()
+        for c in costs:
+            due = c["due_date"].strftime("%d-%m-%Y") if c["due_date"] else "—"
+            label = f"{c['name']} — {eur(c['amount'])} ({c['frequency']}) — {c['status']} — vervalt {due}"
+            with st.expander(label):
+                st.caption(f"Categorie: {c.get('category') or '—'}  ·  Te betalen aan: {c.get('payable_to') or '—'}")
+                if c.get("notes"):
+                    st.write(c["notes"])
+                cc1, cc2, cc3 = st.columns(3)
+                if c["status"] == "Open":
+                    if cc1.button("✅ Markeer als betaald", key=f"paid_rc_{c['id']}"):
+                        db.update_running_cost(c["id"], status="Betaald")
+                        st.rerun()
+                else:
+                    if cc1.button("↩️ Heropenen", key=f"reopen_rc_{c['id']}"):
+                        db.update_running_cost(c["id"], status="Open")
+                        st.rerun()
+                if cc2.button("🗑️ Verwijderen", key=f"del_rc_{c['id']}"):
+                    db.delete_running_cost(c["id"])
+                    st.rerun()
+
+# ===========================================================================
+# PAGINA: PRIVÉ-UITGAVEN
+# ===========================================================================
+elif page == "🏠 Privé-uitgaven":
+    top1, top2 = st.columns([4, 1])
+    with top1:
+        st.title("Privé-uitgaven")
+        st.caption("Persoonlijk huishoudbudget, los van de bedrijfsschulden en -kosten.")
+    with top2:
+        with st.popover("➕ Nieuwe uitgave"):
+            with st.form("add_expense_form", clear_on_submit=True):
+                pe_category = st.selectbox(
+                    "Categorie",
+                    ["Wonen", "Verzekeringen", "Levensonderhoud", "Vervoer", "Overig", "Onvoorzien"],
+                )
+                pe_desc = st.text_input("Omschrijving", placeholder="Bijv. 'Huur', 'Ziektekostenverzekering'")
+                pe_amount = st.number_input("Bedrag per maand", min_value=0.0, step=25.0)
+                if st.form_submit_button("Toevoegen") and pe_desc:
+                    db.add_private_expense(pe_category, pe_desc, pe_amount, current_user)
+                    st.rerun()
+
+    expenses = db.get_private_expenses()
+    if not expenses:
+        st.info("Nog geen privé-uitgaven geregistreerd.")
+    else:
+        total_monthly = sum(e["amount_monthly"] for e in expenses)
+        total_yearly = sum(e["amount_yearly"] for e in expenses)
+        mc1, mc2 = st.columns(2)
+        mc1.metric("Totaal per maand", eur(total_monthly))
+        mc2.metric("Totaal per jaar", eur(total_yearly))
+        st.divider()
+
+        categories = sorted(set(e["category"] for e in expenses))
+        for cat in categories:
+            st.markdown(f"**{cat}**")
+            cat_expenses = [e for e in expenses if e["category"] == cat]
+            for e in cat_expenses:
+                ecol1, ecol2, ecol3 = st.columns([3, 1, 0.5])
+                ecol1.write(e["description"])
+                ecol2.write(eur(e["amount_monthly"]) + " /mnd")
+                if ecol3.button("🗑️", key=f"del_pe_{e['id']}"):
+                    db.delete_private_expense(e["id"])
+                    st.rerun()
 
 # ===========================================================================
 # PAGINA: LIQUIDITEIT
