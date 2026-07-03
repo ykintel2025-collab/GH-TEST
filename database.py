@@ -6,6 +6,7 @@ Verwacht een connectiestring in st.secrets["DB_URL"].
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.errors
 import streamlit as st
 from datetime import date
 
@@ -42,6 +43,41 @@ def init_db():
     ]:
         cur.execute(f"ALTER TABLE debts ADD COLUMN IF NOT EXISTS {col_def}")
 
+    # ---- CONTACTEN (generiek: schuldeisers, hulpverlening, accountants, etc.) ----
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS contacts (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            contact_type TEXT,
+            organization TEXT,
+            address TEXT,
+            postal_code TEXT,
+            city TEXT,
+            phone TEXT,
+            email TEXT,
+            notes TEXT,
+            created_by TEXT,
+            created_at TIMESTAMP DEFAULT now()
+        )
+    """)
+
+    cur.execute("ALTER TABLE debts ADD COLUMN IF NOT EXISTS contact_id INTEGER REFERENCES contacts(id)")
+
+    # Eenmalige migratie: bestaande schulden zonder contact_id krijgen automatisch een contact aangemaakt
+    cur.execute("""
+        SELECT id, creditor_name, address, postal_code, city, phone, email
+        FROM debts WHERE contact_id IS NULL
+    """)
+    to_migrate = cur.fetchall()
+    for (old_id, name, address, postal_code, city, phone, email) in to_migrate:
+        cur.execute(
+            """INSERT INTO contacts (name, contact_type, address, postal_code, city, phone, email)
+               VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+            (name, "Schuldeiser", address, postal_code, city, phone, email),
+        )
+        new_contact_id = cur.fetchone()[0]
+        cur.execute("UPDATE debts SET contact_id = %s WHERE id = %s", (new_contact_id, old_id))
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS debt_logs (
             id SERIAL PRIMARY KEY,
@@ -60,6 +96,44 @@ def init_db():
             date DATE NOT NULL,
             type TEXT DEFAULT 'Private',
             entered_by TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS revenue_streams (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            budgeted_amount NUMERIC DEFAULT 0,
+            year INTEGER,
+            notes TEXT
+        )
+    """)
+
+    cur.execute("ALTER TABLE income ADD COLUMN IF NOT EXISTS stream_id INTEGER REFERENCES revenue_streams(id)")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS running_costs (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            category TEXT,
+            amount NUMERIC NOT NULL,
+            frequency TEXT DEFAULT 'Maandelijks',
+            payable_to TEXT,
+            status TEXT NOT NULL DEFAULT 'Open',
+            due_date DATE,
+            notes TEXT,
+            created_by TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS private_expenses (
+            id SERIAL PRIMARY KEY,
+            category TEXT NOT NULL,
+            description TEXT NOT NULL,
+            amount_monthly NUMERIC DEFAULT 0,
+            amount_yearly NUMERIC DEFAULT 0,
+            created_by TEXT
         )
     """)
 
@@ -122,16 +196,14 @@ def _dict_cursor(conn):
 # DEBTS
 # ---------------------------------------------------------------------------
 
-def add_debt(creditor_name, total_amount, current_amount, priority, status="Open", last_contact=None,
-             address=None, postal_code=None, city=None, phone=None, email=None):
+def add_debt(contact_id, total_amount, current_amount, priority, status="Open", last_contact=None):
+    """Maakt een schuld aan, gekoppeld aan een bestaand contact (zie add_contact)."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """INSERT INTO debts (creditor_name, total_amount, current_amount, priority, status, last_contact,
-                               address, postal_code, city, phone, email)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-        (creditor_name, total_amount, current_amount, priority, status, last_contact or date.today(),
-         address, postal_code, city, phone, email),
+        """INSERT INTO debts (creditor_name, contact_id, total_amount, current_amount, priority, status, last_contact)
+           VALUES ((SELECT name FROM contacts WHERE id = %s), %s, %s, %s, %s, %s, %s)""",
+        (contact_id, contact_id, total_amount, current_amount, priority, status, last_contact or date.today()),
     )
     conn.commit()
     cur.close()
@@ -142,10 +214,7 @@ def add_debt(creditor_name, total_amount, current_amount, priority, status="Open
 def update_debt(debt_id, **fields):
     if not fields:
         return
-    allowed = {
-        "creditor_name", "total_amount", "current_amount", "priority", "status", "last_contact",
-        "address", "postal_code", "city", "phone", "email",
-    }
+    allowed = {"contact_id", "total_amount", "current_amount", "priority", "status", "last_contact"}
     keys = [k for k in fields if k in allowed]
     if not keys:
         return
@@ -172,18 +241,106 @@ def delete_debt(debt_id):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def get_debts(status=None):
+    """Schulden inclusief actuele contactgegevens (via contact_id)."""
     conn = get_connection()
     cur = _dict_cursor(conn)
+    base_query = """
+        SELECT d.id, d.contact_id, d.total_amount, d.current_amount, d.priority, d.status, d.last_contact,
+               c.name AS creditor_name, c.contact_type, c.organization,
+               c.address, c.postal_code, c.city, c.phone, c.email
+        FROM debts d
+        LEFT JOIN contacts c ON c.id = d.contact_id
+    """
     if status:
-        cur.execute(
-            "SELECT * FROM debts WHERE status = %s ORDER BY priority ASC, current_amount DESC", (status,)
-        )
+        cur.execute(base_query + " WHERE d.status = %s ORDER BY d.priority ASC, d.current_amount DESC", (status,))
     else:
-        cur.execute("SELECT * FROM debts ORDER BY priority ASC, current_amount DESC")
+        cur.execute(base_query + " ORDER BY d.priority ASC, d.current_amount DESC")
     rows = [dict(r) for r in cur.fetchall()]
     cur.close()
     conn.close()
     return rows
+
+
+# ---------------------------------------------------------------------------
+# CONTACTEN (schuldeisers, hulpverlening, accountants, overige partijen)
+# ---------------------------------------------------------------------------
+
+def add_contact(name, contact_type=None, organization=None, address=None, postal_code=None,
+                 city=None, phone=None, email=None, notes=None, created_by=None):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO contacts (name, contact_type, organization, address, postal_code, city, phone, email, notes, created_by)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+        (name, contact_type, organization, address, postal_code, city, phone, email, notes, created_by),
+    )
+    new_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    st.cache_data.clear()
+    return new_id
+
+
+def update_contact(contact_id, **fields):
+    if not fields:
+        return
+    allowed = {"name", "contact_type", "organization", "address", "postal_code", "city", "phone", "email", "notes"}
+    keys = [k for k in fields if k in allowed]
+    if not keys:
+        return
+    set_clause = ", ".join(f"{k} = %s" for k in keys)
+    values = [fields[k] for k in keys]
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE contacts SET {set_clause} WHERE id = %s", (*values, contact_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+    st.cache_data.clear()
+
+
+def delete_contact(contact_id):
+    """Verwijdert een contact. Mislukt als er nog een schuld aan gekoppeld is (bescherming tegen dataverlies)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM contacts WHERE id = %s", (contact_id,))
+        conn.commit()
+        st.cache_data.clear()
+        return True, None
+    except psycopg2.errors.ForeignKeyViolation:
+        conn.rollback()
+        return False, "Dit contact is nog gekoppeld aan een schuld en kan niet verwijderd worden."
+    finally:
+        cur.close()
+        conn.close()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_contacts(contact_type=None):
+    conn = get_connection()
+    cur = _dict_cursor(conn)
+    if contact_type:
+        cur.execute("SELECT * FROM contacts WHERE contact_type = %s ORDER BY name", (contact_type,))
+    else:
+        cur.execute("SELECT * FROM contacts ORDER BY name")
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return rows
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_contact_types():
+    """Alle types die al eens gebruikt zijn, voor een dropdown met vrije invoer."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT contact_type FROM contacts WHERE contact_type IS NOT NULL ORDER BY contact_type")
+    types = [r[0] for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return types
 
 
 # ---------------------------------------------------------------------------
@@ -232,12 +389,12 @@ def get_all_debt_logs():
 # INCOME
 # ---------------------------------------------------------------------------
 
-def add_income(source, amount, income_type, entered_by, income_date=None):
+def add_income(source, amount, income_type, entered_by, income_date=None, stream_id=None):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO income (source, amount, date, type, entered_by) VALUES (%s, %s, %s, %s, %s)",
-        (source, amount, income_date or date.today(), income_type, entered_by),
+        "INSERT INTO income (source, amount, date, type, entered_by, stream_id) VALUES (%s, %s, %s, %s, %s, %s)",
+        (source, amount, income_date or date.today(), income_type, entered_by, stream_id),
     )
     conn.commit()
     cur.close()
@@ -264,6 +421,187 @@ def delete_income(income_id):
     cur.close()
     conn.close()
     st.cache_data.clear()
+
+
+# ---------------------------------------------------------------------------
+# REVENUE STREAMS (opbrengsten: begroot vs. werkelijk)
+# ---------------------------------------------------------------------------
+
+def add_revenue_stream(name, budgeted_amount, year=None, notes=None):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO revenue_streams (name, budgeted_amount, year, notes) VALUES (%s, %s, %s, %s)",
+        (name, budgeted_amount, year, notes),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    st.cache_data.clear()
+
+
+def delete_revenue_stream(stream_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM revenue_streams WHERE id = %s", (stream_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    st.cache_data.clear()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_revenue_streams():
+    conn = get_connection()
+    cur = _dict_cursor(conn)
+    cur.execute("SELECT * FROM revenue_streams ORDER BY budgeted_amount DESC NULLS LAST")
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return rows
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_revenue_overview():
+    """Begroot vs. werkelijk gerealiseerd per opbrengstenbron."""
+    conn = get_connection()
+    cur = _dict_cursor(conn)
+    cur.execute("""
+        SELECT rs.id, rs.name, rs.budgeted_amount,
+               COALESCE(SUM(i.amount), 0) AS realized_amount
+        FROM revenue_streams rs
+        LEFT JOIN income i ON i.stream_id = rs.id
+        GROUP BY rs.id, rs.name, rs.budgeted_amount
+        ORDER BY rs.budgeted_amount DESC NULLS LAST
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        r["budgeted_amount"] = float(r["budgeted_amount"] or 0)
+        r["realized_amount"] = float(r["realized_amount"] or 0)
+    cur.close()
+    conn.close()
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# RUNNING COSTS (lopende kosten, incl. eigen vergoeding)
+# ---------------------------------------------------------------------------
+
+def add_running_cost(name, amount, created_by, category=None, frequency="Maandelijks",
+                      payable_to=None, status="Open", due_date=None, notes=None):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO running_costs (name, category, amount, frequency, payable_to, status, due_date, notes, created_by)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+        (name, category, amount, frequency, payable_to, status, due_date, notes, created_by),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    st.cache_data.clear()
+
+
+def update_running_cost(cost_id, **fields):
+    if not fields:
+        return
+    allowed = {"name", "category", "amount", "frequency", "payable_to", "status", "due_date", "notes"}
+    keys = [k for k in fields if k in allowed]
+    if not keys:
+        return
+    set_clause = ", ".join(f"{k} = %s" for k in keys)
+    values = [fields[k] for k in keys]
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE running_costs SET {set_clause} WHERE id = %s", (*values, cost_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+    st.cache_data.clear()
+
+
+def delete_running_cost(cost_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM running_costs WHERE id = %s", (cost_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    st.cache_data.clear()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_running_costs(status=None):
+    conn = get_connection()
+    cur = _dict_cursor(conn)
+    if status:
+        cur.execute("SELECT * FROM running_costs WHERE status = %s ORDER BY due_date ASC NULLS LAST", (status,))
+    else:
+        cur.execute("SELECT * FROM running_costs ORDER BY due_date ASC NULLS LAST")
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# PRIVATE EXPENSES (privé-uitgaven)
+# ---------------------------------------------------------------------------
+
+def add_private_expense(category, description, amount_monthly, created_by):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO private_expenses (category, description, amount_monthly, amount_yearly, created_by)
+           VALUES (%s, %s, %s, %s, %s)""",
+        (category, description, amount_monthly, amount_monthly * 12, created_by),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    st.cache_data.clear()
+
+
+def update_private_expense(expense_id, **fields):
+    if not fields:
+        return
+    allowed = {"category", "description", "amount_monthly", "amount_yearly"}
+    keys = [k for k in fields if k in allowed]
+    if not keys:
+        return
+    if "amount_monthly" in fields and "amount_yearly" not in fields:
+        fields["amount_yearly"] = fields["amount_monthly"] * 12
+        keys.append("amount_yearly")
+    set_clause = ", ".join(f"{k} = %s" for k in keys)
+    values = [fields[k] for k in keys]
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE private_expenses SET {set_clause} WHERE id = %s", (*values, expense_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+    st.cache_data.clear()
+
+
+def delete_private_expense(expense_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM private_expenses WHERE id = %s", (expense_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    st.cache_data.clear()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_private_expenses():
+    conn = get_connection()
+    cur = _dict_cursor(conn)
+    cur.execute("SELECT * FROM private_expenses ORDER BY category, description")
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return rows
 
 
 # ---------------------------------------------------------------------------
