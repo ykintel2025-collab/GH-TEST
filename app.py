@@ -297,6 +297,8 @@ elif page == "📋 Schulden":
                 f"{prio_badge(debt['priority'])}  **{debt['creditor_name']}**  "
                 f"—  {eur(debt['current_amount'])}  ·  {debt['status']}  ·  laatst contact {last_contact}"
             )
+            if debt.get("payment_agreement"):
+                header += f"  ·  📌 _{debt['payment_agreement']}_"
             with st.expander(header):
                 dc1, dc2, dc3, dc4 = st.columns(4)
 
@@ -326,6 +328,15 @@ elif page == "📋 Schulden":
                         st.rerun()
                     if bcol2.button("🗑️", key=f"del_{debt['id']}", help="Schuld verwijderen"):
                         db.delete_debt(debt["id"])
+                        st.rerun()
+
+                new_agreement = st.text_input(
+                    "📌 Betalingsafspraak (bijv. '€500 per maand', 'Zsm', '50K per 31 aug')",
+                    value=debt.get("payment_agreement") or "", key=f"agreement_{debt['id']}",
+                )
+                if new_agreement != (debt.get("payment_agreement") or ""):
+                    if st.button("Afspraak opslaan", key=f"save_agreement_{debt['id']}"):
+                        db.update_debt(debt["id"], payment_agreement=new_agreement or None)
                         st.rerun()
 
                 st.divider()
