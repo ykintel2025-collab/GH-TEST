@@ -13,7 +13,27 @@ import database as db
 import auth
 import emailer
 
-st.set_page_config(page_title="Asset Management Dashboard", layout="wide", page_icon="📊")
+st.set_page_config(
+    page_title="GH2026 (TEST)" if st.secrets.get("ENV", "production").lower() == "test" else "Asset Management Dashboard",
+    layout="wide",
+    page_icon="🧪" if st.secrets.get("ENV", "production").lower() == "test" else "📊",
+)
+
+# --- Omgeving herkennen (test vs. live) -----------------------------------
+ENV = st.secrets.get("ENV", "production")
+IS_TEST = ENV.lower() == "test"
+
+if IS_TEST:
+    st.markdown(
+        """
+        <div style='background-color:#ff4b4b;color:white;padding:10px;
+                    text-align:center;font-weight:bold;border-radius:6px;
+                    margin-bottom:10px;'>
+            🧪 TESTOMGEVING — wijzigingen hier zijn NIET zichtbaar in de live app
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # --- Login ---------------------------------------------------------------
 current_user = auth.check_login()
@@ -80,6 +100,8 @@ def fill_template(text, debt):
 
 # --- Sidebar navigatie -----------------------------------------------------
 with st.sidebar:
+    if IS_TEST:
+        st.markdown("### 🧪 TEST")
     st.write(f"Ingelogd als **{current_user}**")
     if st.button("Uitloggen"):
         st.session_state["authenticated"] = False
