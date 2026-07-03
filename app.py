@@ -44,7 +44,6 @@ db.init_db()
 PRIORITIES = ["A", "B", "C"]
 STATUSES = ["Open", "Paid"]
 PIPELINE_STATUSES = ["Lead", "Pitch", "Deal"]
-INCOME_TYPES = ["Private", "Ambassadorship"]
 ASSIGNEES = ["Ibrahim", "Seal", "Glenn"]
 TASK_STATUSES = ["Open", "Done"]
 
@@ -121,10 +120,7 @@ with st.sidebar:
     st.divider()
     page = st.radio(
         "Navigatie",
-        [
-            "🏠 Dashboard", "📋 Schulden", "👥 Contacten", "✅ Taken", "✉️ Berichten",
-            "📈 Pipeline & Inkomsten", "🧾 Lopende kosten", "🏠 Privé-uitgaven", "💧 Liquiditeit",
-        ],
+        ["🏠 Dashboard", "📋 Schulden", "👥 Contacten", "✅ Taken", "💰 Financieel", "⚙️ Beheer"],
         label_visibility="collapsed",
     )
 
@@ -524,59 +520,315 @@ elif page == "👥 Contacten":
 # PAGINA: TAKEN (volledig beheer)
 # ===========================================================================
 elif page == "✅ Taken":
-    st.title("Taken & Acties")
+    st.title("Taken & Agenda")
 
-    with st.popover("➕ Nieuwe taak"):
-        with st.form("new_task_form", clear_on_submit=True):
-            title = st.text_input("Titel")
-            assignee = st.selectbox("Toewijzen aan", ASSIGNEES)
-            due = st.date_input("Deadline", value=date.today())
-            desc = st.text_area("Toelichting (optioneel)")
-            debts_all = db.get_debts()
-            debt_options = {"— geen —": None}
-            debt_options.update({d["creditor_name"]: d["id"] for d in debts_all})
-            linked = st.selectbox("Koppelen aan schuldeiser (optioneel)", list(debt_options.keys()))
-            if st.form_submit_button("Toevoegen") and title:
-                db.add_task(title, assignee, current_user, description=desc or None, due_date=due, related_debt_id=debt_options[linked])
-                st.rerun()
+    tab_lijst, tab_agenda = st.tabs(["📋 Lijst", "🗓️ Agenda"])
 
-    fcol1, fcol2 = st.columns(2)
-    filter_assignee = fcol1.selectbox("Filter op persoon", ["Iedereen"] + ASSIGNEES)
-    filter_status = fcol2.selectbox("Filter op status", ["Alle", "Open", "Done"])
+    with tab_lijst:
+        with st.popover("➕ Nieuwe taak"):
+            with st.form("new_task_form", clear_on_submit=True):
+                title = st.text_input("Titel")
+                assignee = st.selectbox("Toewijzen aan", ASSIGNEES)
+                due = st.date_input("Deadline", value=date.today())
+                desc = st.text_area("Toelichting (optioneel)")
+                debts_all = db.get_debts()
+                debt_options = {"— geen —": None}
+                debt_options.update({d["creditor_name"]: d["id"] for d in debts_all})
+                linked = st.selectbox("Koppelen aan schuldeiser (optioneel)", list(debt_options.keys()))
+                if st.form_submit_button("Toevoegen") and title:
+                    db.add_task(title, assignee, current_user, description=desc or None, due_date=due, related_debt_id=debt_options[linked])
+                    st.rerun()
 
-    tasks = db.get_tasks(
-        assigned_to=None if filter_assignee == "Iedereen" else filter_assignee,
-        status=None if filter_status == "Alle" else filter_status,
+        fcol1, fcol2 = st.columns(2)
+        filter_assignee = fcol1.selectbox("Filter op persoon", ["Iedereen"] + ASSIGNEES)
+        filter_status = fcol2.selectbox("Filter op status", ["Alle", "Open", "Done"])
+
+        tasks = db.get_tasks(
+            assigned_to=None if filter_assignee == "Iedereen" else filter_assignee,
+            status=None if filter_status == "Alle" else filter_status,
+        )
+
+        if not tasks:
+            st.info("Geen taken gevonden.")
+        else:
+            for t in tasks:
+                cols = st.columns([0.06, 0.5, 0.15, 0.15, 0.14])
+                done = cols[0].checkbox("", value=(t["status"] == "Done"), key=f"taskpage_{t['id']}")
+                title_txt = f"~~{t['title']}~~" if t["status"] == "Done" else f"**{t['title']}**"
+                if t.get("creditor_name"):
+                    title_txt += f" — _{t['creditor_name']}_"
+                cols[1].markdown(title_txt)
+                if t["description"]:
+                    cols[1].caption(t["description"])
+                cols[2].write(t["assigned_to"])
+                cols[3].write(t["due_date"].strftime("%d-%m-%Y") if t["due_date"] else "—")
+                if cols[4].button("🗑️", key=f"deltask_{t['id']}"):
+                    db.delete_task(t["id"])
+                    st.rerun()
+
+                new_status = "Done" if done else "Open"
+                if new_status != t["status"]:
+                    db.update_task(t["id"], status=new_status)
+                    st.rerun()
+
+    with tab_agenda:
+        st.caption("Taken én lopende kosten met een datum, gegroepeerd per week en maand.")
+
+        agenda_items = []
+        for t in db.get_tasks(status="Open"):
+            if t["due_date"]:
+                agenda_items.append({
+                    "date": t["due_date"], "label": f"✅ {t['title']}", "detail": t["assigned_to"],
+                })
+        for c in db.get_running_costs(status="Open"):
+            if c["due_date"]:
+                agenda_items.append({
+                    "date": c["due_date"], "label": f"🧾 {c['name']}", "detail": eur(c["amount"]),
+                })
+
+        if not agenda_items:
+            st.info("Geen geplande taken of kosten gevonden.")
+        else:
+            agenda_items.sort(key=lambda x: x["date"])
+            view_mode = st.radio("Weergave", ["Per week", "Per maand"], horizontal=True)
+
+            groups = {}
+            for item in agenda_items:
+                if view_mode == "Per week":
+                    year, week, _ = item["date"].isocalendar()
+                    key = f"Week {week} — {year}"
+                else:
+                    key = item["date"].strftime("%B %Y")
+                groups.setdefault(key, []).append(item)
+
+            for key, items in groups.items():
+                st.markdown(f"**{key}**")
+                for item in items:
+                    st.write(f"`{item['date'].strftime('%d-%m')}` {item['label']} — {item['detail']}")
+                st.divider()
+
+
+# ===========================================================================
+# PAGINA: FINANCIEEL (Pipeline & Inkomsten / Lopende kosten / Privé / Liquiditeit)
+# ===========================================================================
+elif page == "💰 Financieel":
+    st.title("Financieel")
+    tab_pipeline, tab_costs, tab_prive, tab_liq = st.tabs(
+        ["📈 Pipeline & Inkomsten", "🧾 Lopende kosten", "🏠 Privé-uitgaven", "💧 Liquiditeit"]
     )
 
-    if not tasks:
-        st.info("Geen taken gevonden.")
-    else:
-        for t in tasks:
-            cols = st.columns([0.06, 0.5, 0.15, 0.15, 0.14])
-            done = cols[0].checkbox("", value=(t["status"] == "Done"), key=f"taskpage_{t['id']}")
-            title_txt = f"~~{t['title']}~~" if t["status"] == "Done" else f"**{t['title']}**"
-            if t.get("creditor_name"):
-                title_txt += f" — _{t['creditor_name']}_"
-            cols[1].markdown(title_txt)
-            if t["description"]:
-                cols[1].caption(t["description"])
-            cols[2].write(t["assigned_to"])
-            cols[3].write(t["due_date"].strftime("%d-%m-%Y") if t["due_date"] else "—")
-            if cols[4].button("🗑️", key=f"deltask_{t['id']}"):
-                db.delete_task(t["id"])
-                st.rerun()
+    # --- Tabblad: Pipeline & Inkomsten ------------------------------------
+    with tab_pipeline:
+        st.subheader("📊 Opbrengsten: begroot vs. werkelijk")
+        with st.popover("➕ Opbrengstenbron toevoegen"):
+            with st.form("add_stream_form", clear_on_submit=True):
+                s_name = st.text_input("Naam (bijv. 'ESPN', 'Lezingen bedrijven')")
+                s_budget = st.number_input("Begroot bedrag per jaar", min_value=0.0, step=500.0)
+                s_year = st.number_input("Jaar", min_value=2020, max_value=2100, value=date.today().year, step=1)
+                if st.form_submit_button("Toevoegen") and s_name:
+                    db.add_revenue_stream(s_name, s_budget, year=int(s_year))
+                    st.rerun()
 
-            new_status = "Done" if done else "Open"
-            if new_status != t["status"]:
-                db.update_task(t["id"], status=new_status)
-                st.rerun()
+        overview = db.get_revenue_overview()
+        if not overview:
+            st.info("Nog geen opbrengstenbronnen toegevoegd.")
+        else:
+            for r in overview:
+                pct = (r["realized_amount"] / r["budgeted_amount"] * 100) if r["budgeted_amount"] else 0
+                st.write(f"**{r['name']}** — {eur(r['realized_amount'])} van {eur(r['budgeted_amount'])} begroot")
+                st.progress(min(pct / 100, 1.0), text=f"{pct:.0f}%")
+
+        st.divider()
+        col_income, col_pipeline = st.columns(2)
+
+        with col_income:
+            st.subheader("Inkomsten registreren")
+            with st.form("add_income_form", clear_on_submit=True):
+                source = st.text_input("Bron")
+                amount = st.number_input("Bedrag", min_value=0.0, step=100.0)
+                streams = db.get_revenue_streams()
+                stream_options = {"— geen koppeling —": None}
+                stream_options.update({s["name"]: s["id"] for s in streams})
+                stream_choice = st.selectbox("Koppelen aan opbrengstenbron (optioneel)", list(stream_options.keys()))
+                if st.form_submit_button("Inkomsten toevoegen") and source:
+                    db.add_income(source, amount, "Gerealiseerd", entered_by=current_user, stream_id=stream_options[stream_choice])
+                    st.success("Inkomsten geregistreerd.")
+                    st.rerun()
+
+            st.markdown("**Gerealiseerde inkomsten**")
+            income_rows = db.get_income()
+            if income_rows:
+                idf = pd.DataFrame(income_rows)[["date", "source", "amount", "entered_by"]]
+                idf.columns = ["Datum", "Bron", "Bedrag", "Ingevoerd door"]
+                st.dataframe(idf, use_container_width=True, hide_index=True)
+            else:
+                st.info("Nog geen inkomsten geregistreerd.")
+
+        with col_pipeline:
+            st.subheader("Pipeline: deals & financiering")
+            with st.form("add_pipeline_form", clear_on_submit=True):
+                deal_type = st.radio("Soort", ["Business", "Financiering/lening"], horizontal=True)
+                company = st.text_input("Bedrijf / partij")
+                p_status = st.selectbox("Fase", PIPELINE_STATUSES)
+                potential_value = st.number_input("Potentiële waarde / leenbedrag", min_value=0.0, step=500.0)
+                next_action = st.text_input("Volgende actie")
+                if st.form_submit_button("Toevoegen") and company:
+                    db.add_pipeline(company, p_status, potential_value, next_action, owner=current_user, deal_type=deal_type)
+                    st.success("Toegevoegd.")
+                    st.rerun()
+
+            pipeline_filter = st.radio("Filter", ["Alle", "Business", "Financiering/lening"], horizontal=True)
+            pipeline_rows = db.get_pipeline(deal_type=None if pipeline_filter == "Alle" else pipeline_filter)
+
+            st.markdown("**Overzicht**")
+            if pipeline_rows:
+                for item in pipeline_rows:
+                    type_icon = "🏦" if item.get("deal_type") == "Financiering/lening" else "🤝"
+                    with st.expander(f"{type_icon} {item['company']} — {item['status']} ({eur(item['potential_value'])})"):
+                        st.caption(f"Eigenaar: {item.get('owner') or '—'}  ·  Soort: {item.get('deal_type') or 'Business'}")
+                        new_p_status = st.selectbox(
+                            "Fase bijwerken", PIPELINE_STATUSES,
+                            index=PIPELINE_STATUSES.index(item["status"]) if item["status"] in PIPELINE_STATUSES else 0,
+                            key=f"pstatus_{item['id']}",
+                        )
+                        st.caption(f"Volgende actie: {item['next_action'] or '—'}")
+                        pc1, pc2 = st.columns(2)
+                        if pc1.button("Fase opslaan", key=f"save_pstatus_{item['id']}"):
+                            db.update_pipeline(item["id"], status=new_p_status)
+                            st.rerun()
+                        if pc2.button("🗑️ Verwijderen", key=f"del_pipeline_{item['id']}"):
+                            db.delete_pipeline(item["id"])
+                            st.rerun()
+            else:
+                st.info("Nog geen items.")
+
+    # --- Tabblad: Lopende kosten -------------------------------------------
+    with tab_costs:
+        top1, top2 = st.columns([4, 1])
+        with top1:
+            st.caption("Bedrijfskosten en vergoedingen die (nog) betaald moeten worden — inclusief je eigen fee.")
+        with top2:
+            with st.popover("➕ Nieuwe kostenpost"):
+                with st.form("add_cost_form", clear_on_submit=True):
+                    rc_name = st.text_input("Omschrijving", placeholder="Bijv. 'Beheervergoeding Ibrahim'")
+                    rc_category = st.text_input("Categorie", placeholder="Bijv. Personeel, Advies, Hosting")
+                    rc_amount = st.number_input("Bedrag", min_value=0.0, step=50.0)
+                    rc_frequency = st.selectbox("Frequentie", ["Eenmalig", "Maandelijks", "Jaarlijks"])
+                    rc_payable_to = st.selectbox("Te betalen aan", ASSIGNEES + ["Extern"])
+                    rc_due = st.date_input("Vervaldatum", value=date.today())
+                    rc_notes = st.text_area("Toelichting (optioneel)")
+                    if st.form_submit_button("Toevoegen") and rc_name:
+                        db.add_running_cost(
+                            rc_name, rc_amount, current_user, category=rc_category or None,
+                            frequency=rc_frequency, payable_to=rc_payable_to, due_date=rc_due, notes=rc_notes or None,
+                        )
+                        st.rerun()
+
+        filter_status_rc = st.radio("Filter", ["Alle", "Open", "Betaald"], horizontal=True, key="rc_filter")
+        status_map = {"Open": "Open", "Betaald": "Betaald", "Alle": None}
+        costs = db.get_running_costs(status=status_map[filter_status_rc])
+
+        if not costs:
+            st.info("Nog geen lopende kosten geregistreerd.")
+        else:
+            total_open = sum(c["amount"] for c in costs if c["status"] == "Open")
+            st.metric("Totaal openstaand", eur(total_open))
+            st.divider()
+            for c in costs:
+                due = c["due_date"].strftime("%d-%m-%Y") if c["due_date"] else "—"
+                label = f"{c['name']} — {eur(c['amount'])} ({c['frequency']}) — {c['status']} — vervalt {due}"
+                with st.expander(label):
+                    st.caption(f"Categorie: {c.get('category') or '—'}  ·  Te betalen aan: {c.get('payable_to') or '—'}")
+                    if c.get("notes"):
+                        st.write(c["notes"])
+                    cc1, cc2, cc3 = st.columns(3)
+                    if c["status"] == "Open":
+                        if cc1.button("✅ Markeer als betaald", key=f"paid_rc_{c['id']}"):
+                            db.update_running_cost(c["id"], status="Betaald")
+                            st.rerun()
+                    else:
+                        if cc1.button("↩️ Heropenen", key=f"reopen_rc_{c['id']}"):
+                            db.update_running_cost(c["id"], status="Open")
+                            st.rerun()
+                    if cc2.button("🗑️ Verwijderen", key=f"del_rc_{c['id']}"):
+                        db.delete_running_cost(c["id"])
+                        st.rerun()
+
+    # --- Tabblad: Privé-uitgaven --------------------------------------------
+    with tab_prive:
+        top1, top2 = st.columns([4, 1])
+        with top1:
+            st.caption("Persoonlijk huishoudbudget, los van de bedrijfsschulden en -kosten.")
+        with top2:
+            with st.popover("➕ Nieuwe uitgave"):
+                with st.form("add_expense_form", clear_on_submit=True):
+                    pe_category = st.selectbox(
+                        "Categorie",
+                        ["Wonen", "Verzekeringen", "Levensonderhoud", "Vervoer", "Overig", "Onvoorzien"],
+                    )
+                    pe_desc = st.text_input("Omschrijving", placeholder="Bijv. 'Huur', 'Ziektekostenverzekering'")
+                    pe_amount = st.number_input("Bedrag per maand", min_value=0.0, step=25.0)
+                    if st.form_submit_button("Toevoegen") and pe_desc:
+                        db.add_private_expense(pe_category, pe_desc, pe_amount, current_user)
+                        st.rerun()
+
+        expenses = db.get_private_expenses()
+        if not expenses:
+            st.info("Nog geen privé-uitgaven geregistreerd.")
+        else:
+            total_monthly = sum(e["amount_monthly"] for e in expenses)
+            total_yearly = sum(e["amount_yearly"] for e in expenses)
+            mc1, mc2 = st.columns(2)
+            mc1.metric("Totaal per maand", eur(total_monthly))
+            mc2.metric("Totaal per jaar", eur(total_yearly))
+            st.divider()
+
+            categories = sorted(set(e["category"] for e in expenses))
+            for cat in categories:
+                st.markdown(f"**{cat}**")
+                cat_expenses = [e for e in expenses if e["category"] == cat]
+                for e in cat_expenses:
+                    ecol1, ecol2, ecol3 = st.columns([3, 1, 0.5])
+                    ecol1.write(e["description"])
+                    ecol2.write(eur(e["amount_monthly"]) + " /mnd")
+                    if ecol3.button("🗑️", key=f"del_pe_{e['id']}"):
+                        db.delete_private_expense(e["id"])
+                        st.rerun()
+
+    # --- Tabblad: Liquiditeit ------------------------------------------------
+    with tab_liq:
+        totals = db.get_totals()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Totale inkomsten (gerealiseerd)", eur(totals["total_income"]))
+        c2.metric("Totale schulden (actueel, open)", eur(totals["total_debt_current"]))
+        c3.metric("Netto positie", eur(totals["net_position"]))
+
+        st.divider()
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Schulden — oorspronkelijke hoofdsom", eur(totals["total_debt_original"]))
+        c5.metric("Pipeline-potentieel (nog niet gerealiseerd)", eur(totals["pipeline_potential"]))
+        c6.metric("Totaal afgelost via betalingen", eur(db.get_total_paid()))
+
+        st.divider()
+        st.caption(
+            "Netto positie = Totale inkomsten (totaal) − Totale schulden (actueel, status ≠ Paid). "
+            "Waar geen oorspronkelijke hoofdsom bekend is, wordt het actuele bedrag als hoofdsom gebruikt "
+            "(dus 0% voortgang voor die schuld, in plaats van een vertekend beeld)."
+        )
+
+        if totals["total_debt_original"] > 0:
+            afgelost = totals["total_debt_original"] - totals["total_debt_current"]
+            pct = max(0.0, min(1.0, afgelost / totals["total_debt_original"]))
+            st.markdown("**Voortgang sanering (t.o.v. oorspronkelijke hoofdsom)**")
+            st.progress(pct, text=f"{pct*100:.1f}% afgelost — {eur(afgelost)} van {eur(totals['total_debt_original'])}")
 
 # ===========================================================================
-# PAGINA: BERICHTEN (sjablonen voor mail & WhatsApp)
+# PAGINA: BEHEER (berichtsjablonen, later ook overige instellingen)
 # ===========================================================================
-elif page == "✉️ Berichten":
-    st.title("Berichtsjablonen")
+elif page == "⚙️ Beheer":
+    st.title("Beheer")
+    st.subheader("✉️ Berichtsjablonen")
     st.caption(
         "Standaardteksten voor WhatsApp en e-mail. Gebruik {naam} in de tekst — dat wordt automatisch "
         "vervangen door de naam van de schuldeiser wanneer je een sjabloon gebruikt bij Schulden → Contact."
@@ -616,218 +868,3 @@ elif page == "✉️ Berichten":
                 if st.button("🗑️ Verwijderen", key=f"deltpl_mail_{t['id']}"):
                     db.delete_template(t["id"])
                     st.rerun()
-
-# ===========================================================================
-# PAGINA: PIPELINE & INKOMSTEN
-# ===========================================================================
-elif page == "📈 Pipeline & Inkomsten":
-    st.title("Pipeline & Inkomsten")
-
-    st.subheader("📊 Opbrengsten: begroot vs. werkelijk")
-    with st.popover("➕ Opbrengstenbron toevoegen"):
-        with st.form("add_stream_form", clear_on_submit=True):
-            s_name = st.text_input("Naam (bijv. 'ESPN', 'Lezingen bedrijven')")
-            s_budget = st.number_input("Begroot bedrag per jaar", min_value=0.0, step=500.0)
-            s_year = st.number_input("Jaar", min_value=2020, max_value=2100, value=date.today().year, step=1)
-            if st.form_submit_button("Toevoegen") and s_name:
-                db.add_revenue_stream(s_name, s_budget, year=int(s_year))
-                st.rerun()
-
-    overview = db.get_revenue_overview()
-    if not overview:
-        st.info("Nog geen opbrengstenbronnen toegevoegd.")
-    else:
-        for r in overview:
-            pct = (r["realized_amount"] / r["budgeted_amount"] * 100) if r["budgeted_amount"] else 0
-            st.write(f"**{r['name']}** — {eur(r['realized_amount'])} van {eur(r['budgeted_amount'])} begroot")
-            st.progress(min(pct / 100, 1.0), text=f"{pct:.0f}%")
-
-    st.divider()
-    col_income, col_pipeline = st.columns(2)
-
-    with col_income:
-        st.subheader("Inkomsten registreren")
-        with st.form("add_income_form", clear_on_submit=True):
-            source = st.text_input("Bron")
-            amount = st.number_input("Bedrag", min_value=0.0, step=100.0)
-            income_type = st.selectbox("Type", INCOME_TYPES)
-            streams = db.get_revenue_streams()
-            stream_options = {"— geen koppeling —": None}
-            stream_options.update({s["name"]: s["id"] for s in streams})
-            stream_choice = st.selectbox("Koppelen aan opbrengstenbron (optioneel)", list(stream_options.keys()))
-            if st.form_submit_button("Inkomsten toevoegen") and source:
-                db.add_income(source, amount, income_type, entered_by=current_user, stream_id=stream_options[stream_choice])
-                st.success("Inkomsten geregistreerd.")
-                st.rerun()
-
-        st.markdown("**Gerealiseerde inkomsten**")
-        income_rows = db.get_income()
-        if income_rows:
-            idf = pd.DataFrame(income_rows)[["date", "source", "type", "amount", "entered_by"]]
-            idf.columns = ["Datum", "Bron", "Type", "Bedrag", "Ingevoerd door"]
-            st.dataframe(idf, use_container_width=True, hide_index=True)
-        else:
-            st.info("Nog geen inkomsten geregistreerd.")
-
-    with col_pipeline:
-        st.subheader("Pipeline: leads & deals")
-        with st.form("add_pipeline_form", clear_on_submit=True):
-            company = st.text_input("Bedrijf / partij")
-            p_status = st.selectbox("Fase", PIPELINE_STATUSES)
-            potential_value = st.number_input("Potentiële waarde", min_value=0.0, step=500.0)
-            next_action = st.text_input("Volgende actie")
-            if st.form_submit_button("Pipeline-item toevoegen") and company:
-                db.add_pipeline(company, p_status, potential_value, next_action, owner=current_user)
-                st.success("Pipeline-item toegevoegd.")
-                st.rerun()
-
-        st.markdown("**Overzicht pipeline**")
-        pipeline_rows = db.get_pipeline()
-        if pipeline_rows:
-            for item in pipeline_rows:
-                with st.expander(f"{item['company']} — {item['status']} ({eur(item['potential_value'])})"):
-                    st.caption(f"Eigenaar: {item.get('owner') or '—'}")
-                    new_p_status = st.selectbox(
-                        "Fase bijwerken", PIPELINE_STATUSES,
-                        index=PIPELINE_STATUSES.index(item["status"]) if item["status"] in PIPELINE_STATUSES else 0,
-                        key=f"pstatus_{item['id']}",
-                    )
-                    st.caption(f"Volgende actie: {item['next_action'] or '—'}")
-                    pc1, pc2 = st.columns(2)
-                    if pc1.button("Fase opslaan", key=f"save_pstatus_{item['id']}"):
-                        db.update_pipeline(item["id"], status=new_p_status)
-                        st.rerun()
-                    if pc2.button("🗑️ Verwijderen", key=f"del_pipeline_{item['id']}"):
-                        db.delete_pipeline(item["id"])
-                        st.rerun()
-        else:
-            st.info("Nog geen pipeline-items.")
-
-# ===========================================================================
-# PAGINA: LOPENDE KOSTEN (incl. eigen vergoeding)
-# ===========================================================================
-elif page == "🧾 Lopende kosten":
-    top1, top2 = st.columns([4, 1])
-    with top1:
-        st.title("Lopende kosten")
-        st.caption("Bedrijfskosten en vergoedingen die (nog) betaald moeten worden — inclusief je eigen fee.")
-    with top2:
-        with st.popover("➕ Nieuwe kostenpost"):
-            with st.form("add_cost_form", clear_on_submit=True):
-                rc_name = st.text_input("Omschrijving", placeholder="Bijv. 'Beheervergoeding Ibrahim'")
-                rc_category = st.text_input("Categorie", placeholder="Bijv. Personeel, Advies, Hosting")
-                rc_amount = st.number_input("Bedrag", min_value=0.0, step=50.0)
-                rc_frequency = st.selectbox("Frequentie", ["Eenmalig", "Maandelijks", "Jaarlijks"])
-                rc_payable_to = st.selectbox("Te betalen aan", ASSIGNEES + ["Extern"])
-                rc_due = st.date_input("Vervaldatum", value=date.today())
-                rc_notes = st.text_area("Toelichting (optioneel)")
-                if st.form_submit_button("Toevoegen") and rc_name:
-                    db.add_running_cost(
-                        rc_name, rc_amount, current_user, category=rc_category or None,
-                        frequency=rc_frequency, payable_to=rc_payable_to, due_date=rc_due, notes=rc_notes or None,
-                    )
-                    st.rerun()
-
-    filter_status_rc = st.radio("Filter", ["Alle", "Open", "Betaald"], horizontal=True)
-    status_map = {"Open": "Open", "Betaald": "Betaald", "Alle": None}
-    costs = db.get_running_costs(status=status_map[filter_status_rc])
-
-    if not costs:
-        st.info("Nog geen lopende kosten geregistreerd.")
-    else:
-        total_open = sum(c["amount"] for c in costs if c["status"] == "Open")
-        st.metric("Totaal openstaand", eur(total_open))
-        st.divider()
-        for c in costs:
-            due = c["due_date"].strftime("%d-%m-%Y") if c["due_date"] else "—"
-            label = f"{c['name']} — {eur(c['amount'])} ({c['frequency']}) — {c['status']} — vervalt {due}"
-            with st.expander(label):
-                st.caption(f"Categorie: {c.get('category') or '—'}  ·  Te betalen aan: {c.get('payable_to') or '—'}")
-                if c.get("notes"):
-                    st.write(c["notes"])
-                cc1, cc2, cc3 = st.columns(3)
-                if c["status"] == "Open":
-                    if cc1.button("✅ Markeer als betaald", key=f"paid_rc_{c['id']}"):
-                        db.update_running_cost(c["id"], status="Betaald")
-                        st.rerun()
-                else:
-                    if cc1.button("↩️ Heropenen", key=f"reopen_rc_{c['id']}"):
-                        db.update_running_cost(c["id"], status="Open")
-                        st.rerun()
-                if cc2.button("🗑️ Verwijderen", key=f"del_rc_{c['id']}"):
-                    db.delete_running_cost(c["id"])
-                    st.rerun()
-
-# ===========================================================================
-# PAGINA: PRIVÉ-UITGAVEN
-# ===========================================================================
-elif page == "🏠 Privé-uitgaven":
-    top1, top2 = st.columns([4, 1])
-    with top1:
-        st.title("Privé-uitgaven")
-        st.caption("Persoonlijk huishoudbudget, los van de bedrijfsschulden en -kosten.")
-    with top2:
-        with st.popover("➕ Nieuwe uitgave"):
-            with st.form("add_expense_form", clear_on_submit=True):
-                pe_category = st.selectbox(
-                    "Categorie",
-                    ["Wonen", "Verzekeringen", "Levensonderhoud", "Vervoer", "Overig", "Onvoorzien"],
-                )
-                pe_desc = st.text_input("Omschrijving", placeholder="Bijv. 'Huur', 'Ziektekostenverzekering'")
-                pe_amount = st.number_input("Bedrag per maand", min_value=0.0, step=25.0)
-                if st.form_submit_button("Toevoegen") and pe_desc:
-                    db.add_private_expense(pe_category, pe_desc, pe_amount, current_user)
-                    st.rerun()
-
-    expenses = db.get_private_expenses()
-    if not expenses:
-        st.info("Nog geen privé-uitgaven geregistreerd.")
-    else:
-        total_monthly = sum(e["amount_monthly"] for e in expenses)
-        total_yearly = sum(e["amount_yearly"] for e in expenses)
-        mc1, mc2 = st.columns(2)
-        mc1.metric("Totaal per maand", eur(total_monthly))
-        mc2.metric("Totaal per jaar", eur(total_yearly))
-        st.divider()
-
-        categories = sorted(set(e["category"] for e in expenses))
-        for cat in categories:
-            st.markdown(f"**{cat}**")
-            cat_expenses = [e for e in expenses if e["category"] == cat]
-            for e in cat_expenses:
-                ecol1, ecol2, ecol3 = st.columns([3, 1, 0.5])
-                ecol1.write(e["description"])
-                ecol2.write(eur(e["amount_monthly"]) + " /mnd")
-                if ecol3.button("🗑️", key=f"del_pe_{e['id']}"):
-                    db.delete_private_expense(e["id"])
-                    st.rerun()
-
-# ===========================================================================
-# PAGINA: LIQUIDITEIT
-# ===========================================================================
-elif page == "💧 Liquiditeit":
-    st.title("Liquiditeits-Cockpit")
-    totals = db.get_totals()
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Totale inkomsten (gerealiseerd)", eur(totals["total_income"]))
-    c2.metric("Totale schulden (actueel, open)", eur(totals["total_debt_current"]))
-    c3.metric("Netto positie", eur(totals["net_position"]))
-
-    st.divider()
-    c4, c5, c6 = st.columns(3)
-    c4.metric("Schulden — oorspronkelijke hoofdsom", eur(totals["total_debt_original"]))
-    c5.metric("Pipeline-potentieel (nog niet gerealiseerd)", eur(totals["pipeline_potential"]))
-    c6.metric("Totaal afgelost via betalingen", eur(db.get_total_paid()))
-
-    st.divider()
-    st.caption(
-        "Netto positie = Totale inkomsten (totaal) − Totale schulden (actueel, status ≠ Paid). "
-        "Pipeline-potentieel telt niet mee totdat een deal wordt gerealiseerd en als inkomsten wordt geregistreerd."
-    )
-
-    if totals["total_debt_original"] > 0:
-        afgelost = totals["total_debt_original"] - totals["total_debt_current"]
-        pct = max(0.0, min(1.0, afgelost / totals["total_debt_original"]))
-        st.markdown("**Voortgang sanering (t.o.v. oorspronkelijke hoofdsom)**")
-        st.progress(pct, text=f"{pct*100:.1f}% afgelost — {eur(afgelost)} van {eur(totals['total_debt_original'])}")
