@@ -148,6 +148,7 @@ def init_db():
             owner TEXT
         )
     """)
+    cur.execute("ALTER TABLE pipeline ADD COLUMN IF NOT EXISTS deal_type TEXT DEFAULT 'Business'")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS payments (
@@ -610,12 +611,12 @@ def get_private_expenses():
 # PIPELINE
 # ---------------------------------------------------------------------------
 
-def add_pipeline(company, status, potential_value, next_action, owner):
+def add_pipeline(company, status, potential_value, next_action, owner, deal_type="Business"):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO pipeline (company, status, potential_value, next_action, owner) VALUES (%s, %s, %s, %s, %s)",
-        (company, status, potential_value, next_action, owner),
+        "INSERT INTO pipeline (company, status, potential_value, next_action, owner, deal_type) VALUES (%s, %s, %s, %s, %s, %s)",
+        (company, status, potential_value, next_action, owner, deal_type),
     )
     conn.commit()
     cur.close()
@@ -626,7 +627,7 @@ def add_pipeline(company, status, potential_value, next_action, owner):
 def update_pipeline(pipeline_id, **fields):
     if not fields:
         return
-    allowed = {"company", "status", "potential_value", "next_action", "owner"}
+    allowed = {"company", "status", "potential_value", "next_action", "owner", "deal_type"}
     keys = [k for k in fields if k in allowed]
     if not keys:
         return
@@ -652,10 +653,13 @@ def delete_pipeline(pipeline_id):
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def get_pipeline():
+def get_pipeline(deal_type=None):
     conn = get_connection()
     cur = _dict_cursor(conn)
-    cur.execute("SELECT * FROM pipeline ORDER BY potential_value DESC NULLS LAST")
+    if deal_type:
+        cur.execute("SELECT * FROM pipeline WHERE deal_type = %s ORDER BY potential_value DESC NULLS LAST", (deal_type,))
+    else:
+        cur.execute("SELECT * FROM pipeline ORDER BY potential_value DESC NULLS LAST")
     rows = [dict(r) for r in cur.fetchall()]
     cur.close()
     conn.close()
@@ -906,7 +910,9 @@ def get_totals():
     cur = conn.cursor()
     cur.execute("SELECT COALESCE(SUM(current_amount), 0) FROM debts WHERE status != 'Paid'")
     total_debt_current = cur.fetchone()[0]
-    cur.execute("SELECT COALESCE(SUM(total_amount), 0) FROM debts")
+    # Waar geen oorspronkelijke hoofdsom bekend is, tellen we het actuele bedrag als hoofdsom
+    # (dan is de voortgang voor die schuld 0% i.p.v. een onzinnig negatief getal)
+    cur.execute("SELECT COALESCE(SUM(COALESCE(total_amount, current_amount)), 0) FROM debts")
     total_debt_original = cur.fetchone()[0]
     cur.execute("SELECT COALESCE(SUM(amount), 0) FROM income")
     total_income = cur.fetchone()[0]
