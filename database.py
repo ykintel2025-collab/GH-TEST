@@ -62,6 +62,7 @@ def init_db():
     """)
 
     cur.execute("ALTER TABLE debts ADD COLUMN IF NOT EXISTS contact_id INTEGER REFERENCES contacts(id)")
+    cur.execute("ALTER TABLE debts ADD COLUMN IF NOT EXISTS payment_agreement TEXT")
 
     # Eenmalige migratie: bestaande schulden zonder contact_id krijgen automatisch een contact aangemaakt
     cur.execute("""
@@ -196,14 +197,14 @@ def _dict_cursor(conn):
 # DEBTS
 # ---------------------------------------------------------------------------
 
-def add_debt(contact_id, total_amount, current_amount, priority, status="Open", last_contact=None):
+def add_debt(contact_id, total_amount, current_amount, priority, status="Open", last_contact=None, payment_agreement=None):
     """Maakt een schuld aan, gekoppeld aan een bestaand contact (zie add_contact)."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """INSERT INTO debts (creditor_name, contact_id, total_amount, current_amount, priority, status, last_contact)
-           VALUES ((SELECT name FROM contacts WHERE id = %s), %s, %s, %s, %s, %s, %s)""",
-        (contact_id, contact_id, total_amount, current_amount, priority, status, last_contact or date.today()),
+        """INSERT INTO debts (creditor_name, contact_id, total_amount, current_amount, priority, status, last_contact, payment_agreement)
+           VALUES ((SELECT name FROM contacts WHERE id = %s), %s, %s, %s, %s, %s, %s, %s)""",
+        (contact_id, contact_id, total_amount, current_amount, priority, status, last_contact or date.today(), payment_agreement),
     )
     conn.commit()
     cur.close()
@@ -214,7 +215,7 @@ def add_debt(contact_id, total_amount, current_amount, priority, status="Open", 
 def update_debt(debt_id, **fields):
     if not fields:
         return
-    allowed = {"contact_id", "total_amount", "current_amount", "priority", "status", "last_contact"}
+    allowed = {"contact_id", "total_amount", "current_amount", "priority", "status", "last_contact", "payment_agreement"}
     keys = [k for k in fields if k in allowed]
     if not keys:
         return
@@ -246,6 +247,7 @@ def get_debts(status=None):
     cur = _dict_cursor(conn)
     base_query = """
         SELECT d.id, d.contact_id, d.total_amount, d.current_amount, d.priority, d.status, d.last_contact,
+               d.payment_agreement,
                c.name AS creditor_name, c.contact_type, c.organization,
                c.address, c.postal_code, c.city, c.phone, c.email
         FROM debts d
